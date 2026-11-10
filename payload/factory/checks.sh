@@ -5,7 +5,8 @@
 # the working directory. Keep it fast, deterministic and non-interactive: no
 # watch modes, no prompts, nothing that rewrites files.
 #
-# INSTALL.md replaces the line below with this project's real commands, e.g.:
+# /factory-setup (INSTALL.md, "checks" section) tells the installer to replace the
+# placeholder below with this project's real commands, e.g.:
 #
 #   npm ci --prefer-offline
 #   npm run lint
