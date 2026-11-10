@@ -1,0 +1,5 @@
+The files under payload/ are derived from "software-factory-claude-code-v2" in
+https://github.com/zazencodes/zazencodes-season-3 (by ZazenCodes), snapshot of
+commit 5fc7c983f44d623057ef65361f25cf23cab2abef, licensed GPLv3. Changes here
+are limited to packaging them for /factory-setup. This repository is likewise
+GPLv3 (see LICENSE).
