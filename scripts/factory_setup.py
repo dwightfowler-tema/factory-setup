@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,14 +39,16 @@ ADAPTED = PROJECT_OWNED | {
     ".claude/agents/reviewer-ui.md",
     ".claude/agents/reviewer-ux.md",
 }
-EXEC = {"factory/checks.sh", "factory/bin/job", "factory/bin/gate", "factory/bin/route"}
-IGNORE_LINES = ["/factory/jobs/", "/.worktrees/"]
+EXEC = {"factory/checks.sh", "factory/bin/job", "factory/bin/gate", "factory/bin/route", "factory/bin/dashboard"}
+IGNORE_LINES = ["/factory/jobs/", "/.worktrees/", "/factory/.dashboard.pid", "/factory/.dashboard.log"]
 LABELS = [
     ("factory", "5319E7", "Build this with the software factory"),
     ("factory:needs-info", "FBCA04", "The factory asked the author a question"),
     ("factory:needs-human", "D93F0B", "The factory needs a human decision on the PR"),
 ]
 SECTION_MARK = "## Software factory"
+BEGIN = "<!-- factory-setup:begin -->"
+END = "<!-- factory-setup:end -->"
 MANIFEST = Path("factory/.setup-manifest.json")
 
 
@@ -204,17 +207,59 @@ def cmd_gitignore(root, args):
 
 
 # ---------------------------------------------------------------- agents-md
-def cmd_agents_md(root, args):
-    target = next((root / n for n in ("AGENTS.md", "CLAUDE.md") if (root / n).exists()), root / "AGENTS.md")
+def agents_target(root):
+    return next((root / n for n in ("AGENTS.md", "CLAUDE.md") if (root / n).exists()), root / "AGENTS.md")
+
+
+def find_section(text):
+    """Locate the factory section: ('marked'|'legacy'|None, start, end)."""
+    if BEGIN in text and END in text:
+        return "marked", text.index(BEGIN), text.index(END) + len(END)
+    m = re.search(r"^## Software factory\s*$", text, re.M)
+    if m:
+        nxt = re.search(r"^## ", text[m.end():], re.M)
+        return "legacy", m.start(), (m.end() + nxt.start() if nxt else len(text))
+    return None, 0, 0
+
+
+def section_state(root):
+    """current | stale | legacy | missing, for upgrade-plan."""
+    target = agents_target(root)
     text = target.read_text() if target.exists() else ""
-    if SECTION_MARK in text:
-        print(f"{target.name} already has the factory section")
-        return
-    section = (TEMPLATES / "agents-section.md").read_text()
-    target.write_text(text + ("\n" if text and not text.endswith("\n\n") else "") + section)
-    print(f"appended the factory section to {target.name}")
-    if not text:
-        print("NOTE  file was new: add setup, dev-server and validation notes (see INSTALL.md)")
+    kind, i, j = find_section(text)
+    if kind is None:
+        return "missing"
+    if kind == "legacy":
+        return "legacy"
+    tpl = (TEMPLATES / "agents-section.md").read_text().strip()
+    return "current" if text[i:j].strip() == tpl else "stale"
+
+
+def cmd_agents_md(root, args):
+    target = agents_target(root)
+    text = target.read_text() if target.exists() else ""
+    tpl = (TEMPLATES / "agents-section.md").read_text().strip()
+    kind, i, j = find_section(text)
+    rest = text[j:]
+    if kind is None:
+        target.write_text(text + ("\n" if text and not text.endswith("\n\n") else "") + tpl + "\n")
+        print(f"appended the factory section to {target.name}")
+        if not text:
+            print("NOTE  file was new: add setup, dev-server and validation notes (see INSTALL.md)")
+    elif kind == "marked":
+        if text[i:j].strip() == tpl:
+            print(f"{target.name} factory section is up to date")
+        else:
+            target.write_text(text[:i] + tpl + rest)
+            print(f"refreshed the factory section in {target.name} (only the part between the markers)")
+    elif args.migrate:
+        target.write_text(text[:i] + tpl + ("\n\n" + rest.lstrip("\n") if rest.strip() else "\n"))
+        print(f"replaced the old unmarked factory section in {target.name} (from '## Software factory' to the "
+              "next '## ' heading) with the marked, current one")
+    else:
+        print(f"WARN  {target.name} has an old factory section without markers (it likely names the old dashboard "
+              "command). Re-run with --migrate to replace it (everything from '## Software factory' to the next "
+              "'## ' heading), or edit it by hand.")
 
 
 # ------------------------------------------------------------------- labels
@@ -270,6 +315,94 @@ def _walk(data, dotted, create=False):
     return node, keys[-1]
 
 
+# --- minimal JSON scanner: find a value's span in the raw text so `config set` edits only those characters
+def _ws(t, i):
+    while i < len(t) and t[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _value_end(t, i):
+    """Index just past the JSON value that starts at t[i]."""
+    c = t[i]
+    if c == '"':
+        i += 1
+        while t[i] != '"':
+            i += 2 if t[i] == "\\" else 1
+        return i + 1
+    if c in "{[":
+        close = "}" if c == "{" else "]"
+        i = _ws(t, i + 1)
+        while t[i] != close:
+            if c == "{":
+                i = _ws(t, _value_end(t, i))  # key
+                i = _ws(t, i + 1)             # colon
+            i = _ws(t, _value_end(t, i))
+            if t[i] == ",":
+                i = _ws(t, i + 1)
+        return i + 1
+    while i < len(t) and t[i] not in ",}] \t\r\n":
+        i += 1
+    return i
+
+
+def _members(t, i):
+    """Members of the object starting at t[i]: [(key, key_start, value_start, value_end)]."""
+    out = []
+    i = _ws(t, i + 1)
+    while t[i] != "}":
+        ks = i
+        ke = _value_end(t, i)
+        i = _ws(t, _ws(t, ke) + 1)
+        ve = _value_end(t, i)
+        out.append((json.loads(t[ks:ke]), ks, i, ve))
+        i = _ws(t, ve)
+        if t[i] == ",":
+            i = _ws(t, i + 1)
+    return out
+
+
+def _inline(value):
+    return json.dumps(value, separators=(", ", ": "))
+
+
+def _edit_text(text, dotted, new, add):
+    """Return text with only the target value replaced or added, or None to fall back to a rewrite."""
+    keys = dotted.split(".")
+    obj = _ws(text, 0)
+    if text[obj] != "{":
+        return None
+    for n, k in enumerate(keys):
+        members = _members(text, obj)
+        hit = [m for m in members if m[0] == k]
+        last = n == len(keys) - 1
+        if hit and last:
+            _, _, vs, ve = hit[0]
+            return text[:vs] + _inline(new) + text[ve:]
+        if hit:
+            obj = hit[0][2]
+            if text[obj] != "{":
+                return None
+            continue
+        if not add:
+            return None
+        # k is missing here: add it (wrapping the value in the remaining nested keys) to this object
+        value = new
+        for rest in reversed(keys[n + 1:]):
+            value = {rest: value}
+        end = _value_end(text, obj)  # just past the closing brace
+        entry = f"{json.dumps(k)}: {_inline(value)}"
+        if not members:
+            return text[:obj + 1] + " " + entry + " " + text[end - 1:]
+        last_end = members[-1][3]
+        if "\n" in text[obj:end]:
+            line_start = text.rfind("\n", 0, members[-1][1]) + 1
+            indent = text[line_start:members[-1][1]]
+            return text[:last_end] + ",\n" + indent + entry + text[last_end:]
+        return text[:last_end] + ", " + entry + text[last_end:]
+    return None
+
+
 def cmd_config(root, args):
     path = _config_path(root)
     data, trailing_nl = _config_load(path)
@@ -283,17 +416,39 @@ def cmd_config(root, args):
         new = json.loads(args.value)
     except json.JSONDecodeError:
         new = args.value
-    node, key = _walk(data, args.key, create=args.add)
-    if key not in node and not args.add:
+    node, key = _walk(data, args.key, create=False) if not args.add else _walk_or_none(data, args.key)
+    if (node is None or key not in node) and not args.add:
         sys.exit(f"no such key: {args.key} (pass --add to create it)")
-    old = node.get(key, "<unset>")
-    node[key] = new
-    out = json.dumps(data, indent=2) + ("\n" if trailing_nl else "")
-    json.loads(out)  # re-validate before touching the real file
+    old = node.get(key, "<unset>") if node is not None else "<unset>"
+    text = path.read_text()
+    out = _edit_text(text, args.key, new, args.add)
+    note = ""
+    if out is None:  # unusual shapes (e.g. a parent that isn't an object): rebuild, which re-indents the file
+        node, key = _walk(data, args.key, create=True)
+        node[key] = new
+        out = json.dumps(data, indent=2) + ("\n" if trailing_nl else "")
+        note = "  (NOTE: unusual structure, so the file was re-indented)"
+    check = json.loads(out)  # re-validate before touching the real file, and verify the value landed
+    probe = check
+    for k in args.key.split("."):
+        probe = probe[k]
+    if probe != new:
+        sys.exit("internal error: edited value did not parse back to the requested value; file left untouched")
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(out)
     os.replace(tmp, path)
-    print(f"{args.key}: {json.dumps(old) if old != '<unset>' else old} -> {json.dumps(new)}")
+    print(f"{args.key}: {json.dumps(old) if old != '<unset>' else old} -> {json.dumps(new)}{note}")
+
+
+def _walk_or_none(data, dotted):
+    """Like _walk, but returns (None, key) when a parent is missing (so --add can create it)."""
+    keys = dotted.split(".")
+    node = data
+    for k in keys[:-1]:
+        if not isinstance(node, dict) or k not in node:
+            return None, keys[-1]
+        node = node[k]
+    return (node if isinstance(node, dict) else None), keys[-1]
 
 
 # ------------------------------------------------------------------- detect
@@ -359,6 +514,63 @@ def cmd_detect(root, args):
     if gaps:
         print("\nGAPS (tell the user the gate is only as strong as the tests/build):")
         print("\n".join(f"  - {g}" for g in gaps))
+    scan_not_run(root)
+
+
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", ".worktrees", "factory", "__pycache__", "target", "dist",
+             "build", ".tox", ".mypy_cache", ".pytest_cache"}
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)(/|$)|(^|/)test_[^/]*\.py$|_test\.(py|go)$|\.(test|spec)\.[jt]sx?$")
+SKIP_RULES = [
+    (re.compile(r"\.py$"), re.compile(r"pytest\.skip|pytest\.mark\.(skip|skipif|xfail)|unittest\.skip|\bxfail\b"), "python"),
+    (re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs)$"),
+     re.compile(r"\b(it|test|describe)\.(skip|todo)\(|\bxit\(|\bxdescribe\(|\bxtest\("), "js/ts"),
+    (re.compile(r"_test\.go$"), re.compile(r"\bt\.Skip(Now|f)?\("), "go"),
+    (re.compile(r"\.rs$"), re.compile(r"#\[ignore"), "rust"),
+]
+DESELECT_FILES = ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "package.json", "jest.config.js",
+                  "jest.config.ts", "vitest.config.ts", "vitest.config.js")
+DESELECT = re.compile(r"addopts[^\n]*(-m\b|--deselect|--ignore)|testPathIgnorePatterns|--testPathIgnorePatterns")
+
+
+def scan_not_run(root):
+    """Report skipped/xfail/ignored tests and deselecting config. A test that doesn't run is a failure."""
+    hits = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            rel = path.relative_to(root).as_posix()
+            if path.stat().st_size > 1_000_000:
+                continue
+            for ext, pattern, label in SKIP_RULES:
+                if ext.search(name) and (label in ("go", "rust") or TEST_PATH.search(rel)):
+                    try:
+                        lines = path.read_text(errors="ignore").splitlines()
+                    except OSError:
+                        continue
+                    for n, line in enumerate(lines, 1):
+                        if pattern.search(line):
+                            hits.setdefault(label, []).append(f"{rel}:{n}: {line.strip()[:90]}")
+    deselect = []
+    for name in DESELECT_FILES:
+        f = root / name
+        if f.exists():
+            for n, line in enumerate(f.read_text(errors="ignore").splitlines(), 1):
+                if DESELECT.search(line):
+                    deselect.append(f"{name}:{n}: {line.strip()[:90]}")
+    if not hits and not deselect:
+        print("\nNo skipped/xfail/ignored tests or deselecting config found.")
+        return
+    print("\nTESTS THAT WOULD NOT RUN (a skipped, xfailed, ignored or deselected test is a FAILURE, never a pass: "
+          "fix it, or ask the owner; do not quietly exclude it):")
+    for label, items in hits.items():
+        print(f"  {label}: {len(items)} found")
+        for it in items[:5]:
+            print(f"    {it}")
+    if deselect:
+        print(f"  deselecting config: {len(deselect)} found")
+        for it in deselect[:5]:
+            print(f"    {it}")
 
 
 # ------------------------------------------------------------ verify-checks
@@ -373,6 +585,21 @@ NOISE = re.compile(
     r"|Collecting\b|Requirement already|Using cached|Successfully installed|Obtaining\b|Preparing metadata"
     r"|Installing collected|npm (warn|notice)\b|added \d+ packages)")
 ERRLINE = re.compile(r"error|FAIL|Traceback", re.I)
+
+
+NOT_RUN = re.compile(r"\b(\d+)\s+(skipped|xfailed|xpassed|deselected|ignored|pending|todo)\b", re.I)
+
+
+def not_run(log):
+    """Counts of tests the output says did not run: skipped, xfailed, xpassed, deselected, ignored, ..."""
+    found = {}
+    for n, kind in NOT_RUN.findall(log):
+        if int(n):
+            found[kind.lower()] = found.get(kind.lower(), 0) + int(n)
+    go = len(re.findall(r"^\s*--- SKIP", log, re.M))
+    if go:
+        found["skipped"] = found.get("skipped", 0) + go
+    return found
 
 
 def summarize(log, n):
@@ -423,6 +650,14 @@ def cmd_verify_checks(root, args):
             if code:
                 report(f"clean-{i}", log, logdir, 25)
                 ok = False
+            skipped = not_run(log)
+            if skipped:
+                print(f"FAIL  clean run {i}: tests did not run: "
+                      + ", ".join(f"{n} {k}" for k, n in sorted(skipped.items()))
+                      + ". A skipped, deselected or not-run test is a failure, not a pass: make checks.sh fail on it.")
+                ok = False
+            elif code == 0:
+                print(f"      no skipped/deselected/not-run tests reported in run {i}'s output")
         if args.break_file:
             if not ok:
                 print("SKIP  sabotage run: the clean runs already fail, so a failure now would prove nothing. "
@@ -523,7 +758,13 @@ def cmd_upgrade_plan(root, args):
     if kept:
         print(f"kept              {len(kept)} tailored file(s) with nothing to merge (payload unchanged): "
               + ", ".join(kept))
-    if not (todo or held or other):
+    state = section_state(root)
+    if state in ("stale", "legacy"):
+        print(f"agents-md         the factory section in {agents_target(root).name} is "
+              + ("stale (older than this skill's template)" if state == "stale"
+                 else "an old unmarked section (it likely names the old dashboard command)")
+              + "; run `SCRIPT agents-md" + (" --migrate" if state == "legacy" else "") + "` to update it")
+    if not (todo or held or other or state in ("stale", "legacy")):
         print("Nothing to do: only the version stamp and manifest will be refreshed.")
     if todo:
         print(f"\n`{'`, `'.join(APPLY_KINDS)}` are applied by `upgrade-apply --yes`.")
@@ -544,7 +785,8 @@ def cmd_upgrade_apply(root, args):
     if not args.yes:
         print("DRY RUN: nothing changed. Would overwrite: " + (", ".join(todo) or "no payload files"))
         print("Would hold for a manual merge: " + (", ".join(sorted(held)) or "nothing"))
-        print(f"Would update factory/VERSION {old_version} -> {VERSION} and the manifest.")
+        print(f"Would update factory/VERSION {old_version} -> {VERSION} and the manifest, and make sure "
+              ".gitignore has the factory lines.")
         print("Review upgrade-plan with the user, then re-run with --yes.")
         return
     for f in todo:
@@ -567,6 +809,7 @@ def cmd_upgrade_apply(root, args):
             reviewed[f] = sha(PAYLOAD / f)
     new["reviewed"] = reviewed
     (root / MANIFEST).write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
+    cmd_gitignore(root, args)
     stamp = (f"Updated factory/VERSION {old_version} -> {VERSION}" if old_version != VERSION
              else f"factory/VERSION already {VERSION}")
     print(f"{stamp} and the manifest; "
@@ -590,7 +833,9 @@ def build_parser():
     add("preflight", "check git, origin, gh, claude, python, clashes; WARN on dirty tree or unpushed commits")
     add("copy", "copy payload/ into the repo; write factory/VERSION and the manifest")
     add("gitignore", "append the factory's two ignore lines (idempotent)")
-    add("agents-md", "add the factory section to AGENTS.md / CLAUDE.md (idempotent)")
+    am = add("agents-md", "add or refresh the factory section in AGENTS.md / CLAUDE.md (between markers)")
+    am.add_argument("--migrate", action="store_true",
+                    help="replace an old section that has no markers (from '## Software factory' to the next '## ')")
     lab = add("labels", "list the three GitHub labels (dry run); with --yes create them (idempotent)")
     lab.add_argument("--yes", action="store_true", help="actually create/update the labels on GitHub")
     cfg = add("config", "get/set a key in factory/config.json (never hand-edit the file)")
@@ -616,6 +861,8 @@ def build_parser():
 
 
 def main(argv):
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `... | head` shouldn't traceback
     parser = build_parser()
     args = parser.parse_args(argv)  # --help/-h anywhere prints usage and exits before anything runs
     if not args.cmd:

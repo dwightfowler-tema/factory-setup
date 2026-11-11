@@ -35,5 +35,7 @@ run `init` over an existing install.
 - `checks.sh` is the factory's gate and the factory can never edit it. Writing it
   is the most important step: show the user the result.
 - Commit only the files the install added or changed, by explicit path.
+- A skipped, xfailed, deselected or not-run test is a failure, never a pass. Never write a
+  `checks.sh` that tolerates one, and never quietly exclude a test; ask the owner.
 - Never edit the copied `factory/bin/*`, `.claude/skills/factory/SKILL.md`, or an
   agent's structure, file name, first-line format or one-line reply.

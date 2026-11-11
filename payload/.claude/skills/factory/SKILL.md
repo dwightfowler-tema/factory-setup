@@ -15,6 +15,7 @@ tell the user; never work around it.
 ```
 /factory run          drain the queue: every open `factory` issue, `concurrency` at a time; also resumes
 /factory run <n>      run one issue now
+/factory dashboard [start|stop|status]   start, stop or check the dashboard
 /factory <anything>   talk to the factory: ask about jobs, give feedback, file a feature
 ```
 
@@ -187,6 +188,18 @@ as `resume`: run `factory/bin/job advance <id> intake` and go to **intake**.
 Run one issue with the same steps. If `factory/bin/job queue` shows a job for
 it, resume that job; otherwise `factory/bin/job create <n>`. Finish with the
 summary line for that job.
+
+## /factory dashboard [start|stop|status]
+
+Run `factory/bin/dashboard <action>` from the repo root (never `cd` into
+`factory/`, which would move your working directory) and report its output.
+With no action, run `status`. The script serves `factory/` on 127.0.0.1 only, on
+`dashboard.port` from `config.json` (default 8000), in the background, and tracks
+it with `factory/.dashboard.pid`. `stop` signals only that PID, after confirming
+it is this repo's server; never stop it with `pkill` or by process name. Don't
+stop the dashboard when a run ends: it only reads `factory/jobs/` and needs no
+session. A user who wants it stopped at session end can add a session-end hook to
+their own user settings; this skill doesn't install one.
 
 ## /factory <anything>
 

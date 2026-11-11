@@ -54,6 +54,11 @@ other jobs.
   conflicts.
 - Make the simplest change that fully meets the spec. No fallbacks, hidden
   defaults or extras the spec doesn't ask for.
+- Never make a test pass by not running it: no `skip`, `xfail`, `.skip`, `xit`,
+  `t.Skip`, `#[ignore]`, no deselecting markers or `addopts`, no `|| true`. A
+  skipped, deselected or not-run test is a failure, not a pass. If a test can't
+  run because the environment is misconfigured, that is a failure to report
+  (BLOCKED), not something to skip.
 - Never modify or delete an existing file that matches `protected_paths` in
   `factory/config.json`; the gate fails the branch if you do. If the spec
   can't be met without changing a protected file, write a BLOCKED build.md
@@ -114,7 +119,9 @@ The files changed and what each change does.
 2. [x] ...
 
 ## Validation
-The commands you ran and whether each one passed.
+The commands you ran and whether each one passed. State the counts of tests
+that ran, passed and did not run (skipped, xfailed, deselected); the last must
+be 0.
 
 ## Log
 ### Round <N>

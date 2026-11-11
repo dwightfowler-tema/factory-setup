@@ -40,6 +40,9 @@ APPROVE only if all of these hold:
   you find convincing. Spot-check at least one criterion yourself.
 - The final round's `checks.md` says `GATE: PASS`, every review in it is
   `VERDICT: PASS`, and no Note in them describes a real problem.
+- No test was skipped, xfailed, deselected or otherwise not run: `checks.md` and
+  build.md show zero tests that did not run. Never approve on "tests pass" when
+  any test did not run: a skipped test is a failure, so ESCALATE.
 - The change stays inside intake's Scope.
 
 ESCALATE if any of them fails, or if the change:
@@ -60,7 +63,8 @@ Tailor these lists to the project: what must a human always see here?
 APPROVE | ESCALATE
 
 ## Summary
-- 3 to 5 short bullets: what happened in this step and why
+- 3 to 5 short bullets: what happened in this step and why, including how many
+  tests did not run (it must be 0 to APPROVE)
 
 ## Why
 Two or three sentences.

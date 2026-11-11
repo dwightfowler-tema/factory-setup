@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Start, stop and check the factory dashboard.
+
+Usage:
+  dashboard start     serve factory/ on 127.0.0.1 in the background; print the URL
+  dashboard stop      stop OUR server by the PID in factory/.dashboard.pid
+  dashboard status    running or not, PID, URL; clean up a stale pid file
+
+The dashboard only reads factory/jobs/, so it needs no Claude session and keeps
+running after the chat ends: stop it with `dashboard stop`. Run this from the repo
+root without `cd`, so your working directory doesn't move. It binds to 127.0.0.1,
+never the LAN, on `dashboard.port` from config.json (default 8000). It never kills
+by process name: a PID is signalled only after its command line is confirmed to be
+this repo's http.server.
+"""
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+FACTORY = REPO / "factory"
+PIDFILE = FACTORY / ".dashboard.pid"
+LOGFILE = FACTORY / ".dashboard.log"
+HOST = "127.0.0.1"
+
+
+def port():
+    try:
+        value = json.loads((FACTORY / "config.json").read_text()).get("dashboard", {}).get("port", 8000)
+        return int(value)
+    except (OSError, ValueError, TypeError):
+        return 8000
+
+
+def url():
+    return f"http://{HOST}:{port()}/dashboard.html"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def command_of(pid):
+    res = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def is_ours(pid):
+    """True only if the PID is an http.server serving this repo's factory/ directory."""
+    cmd = command_of(pid)
+    return "http.server" in cmd and str(FACTORY) in cmd
+
+
+def read_pid():
+    try:
+        return int(PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def port_in_use():
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex((HOST, port())) == 0
+
+
+def running():
+    """PID of our live server, or None. Removes a stale pid file."""
+    pid = read_pid()
+    if pid is None:
+        PIDFILE.unlink(missing_ok=True)
+        return None
+    if alive(pid) and is_ours(pid):
+        return pid
+    PIDFILE.unlink(missing_ok=True)
+    print(f"dashboard: removed stale pid file (pid {pid} is not our server); nothing was killed")
+    return None
+
+
+def start():
+    pid = running()
+    if pid:
+        print(f"dashboard: already running (pid {pid}) at {url()}")
+        sys.exit(1)
+    if port_in_use():
+        print(f"dashboard: port {port()} is in use by another process; set dashboard.port in "
+              f"factory/config.json or stop that process yourself", file=sys.stderr)
+        sys.exit(1)
+    log = open(LOGFILE, "w")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port()), "--bind", HOST, "-d", str(FACTORY)],
+        cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    for _ in range(20):
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            break
+        if port_in_use():
+            break
+    if proc.poll() is not None:
+        print(f"dashboard: server exited immediately; see {LOGFILE}", file=sys.stderr)
+        sys.exit(1)
+    PIDFILE.write_text(f"{proc.pid}\n")
+    print(f"dashboard: started (pid {proc.pid}) at {url()}")
+    print("stop it with: factory/bin/dashboard stop")
+
+
+def stop():
+    pid = read_pid()
+    if pid is None:
+        PIDFILE.unlink(missing_ok=True)
+        print("dashboard: not running (no pid file); nothing to stop")
+        return
+    if not (alive(pid) and is_ours(pid)):
+        PIDFILE.unlink(missing_ok=True)
+        print(f"dashboard: pid file named {pid}, which is not our server; removed the pid file, "
+              "killed nothing")
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        time.sleep(0.1)
+        if not alive(pid):
+            break
+    else:
+        if is_ours(pid):
+            os.kill(pid, signal.SIGKILL)
+    PIDFILE.unlink(missing_ok=True)
+    print(f"dashboard: stopped pid {pid}")
+
+
+def status():
+    pid = running()
+    if pid:
+        print(f"dashboard: running (pid {pid}) at {url()}")
+    else:
+        print("dashboard: not running")
+        sys.exit(3)
+
+
+def main(argv):
+    action = argv[0] if len(argv) == 1 else None
+    if action in ("-h", "--help") or action not in ("start", "stop", "status"):
+        print(__doc__.strip())
+        sys.exit(0 if action in ("-h", "--help") else 2)
+    {"start": start, "stop": stop, "status": status}[action]()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

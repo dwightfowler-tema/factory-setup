@@ -49,7 +49,11 @@ rewrites files, such as `--fix`.
 - **Docs**: AGENTS.md and any docs it lists are updated where the change
   requires it.
 - **Tests**: new behaviour has tests where the repo has a test runner, and no
-  existing test was weakened, skipped or special-cased to pass.
+  existing test was weakened, skipped or special-cased to pass. A skipped,
+  xfailed, deselected or not-run test is a failure to report (CHANGES), whether
+  the branch adds the skip, widens a marker or `addopts` to deselect tests, or
+  `checks.md` shows tests that did not run. Never call a run clean when any test
+  did not run.
 - **Commits**: short one-line messages and nothing stray committed. Trailers
   and attribution (`Co-Authored-By` and the like) are the builder's, not
   yours: the builder runs on a different model than you, so never compare
@@ -77,5 +81,6 @@ Non-blocking observations. Optional.
 - `## Summary` comes right after the header: 3 to 5 short bullets a human can
   skim on the dashboard. The detail goes in the sections below it.
 - Under Findings, write "None." when there are none.
+- Say in `## Summary` how many tests did not run (skipped, xfailed, deselected).
 
 When you're done, reply with one line: the first line of review-code.md.

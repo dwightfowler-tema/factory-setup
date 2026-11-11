@@ -18,14 +18,16 @@ not needed.
    fix. Common ones: `origin/<base>` doesn't exist because the default branch was
    never pushed.
    - On a WARN about staged or uncommitted changes, tell the user the install
-     should start from a committed tree (see *checks*, step 4).
+     should start from a committed tree (see *checks*, step 5).
    - On a WARN that HEAD is ahead of `origin/<base>`: jobs branch from
      `origin/<base>`, so everything `checks.sh` depends on (lockfile, tests,
      config), not just the factory files, must be pushed there before the first run.
 2. **Copy.** `SCRIPT copy`. It refuses to overwrite and writes `factory/VERSION`
    plus `factory/.setup-manifest.json` (used by `upgrade`; commit both).
-3. **Ignore and docs.** `SCRIPT gitignore`, then `SCRIPT agents-md`. If the
-   AGENTS.md / CLAUDE.md is new or lacks them, add: how to set up a fresh
+3. **Ignore and docs.** `SCRIPT gitignore`, then `SCRIPT agents-md`. The section
+   it writes sits between `<!-- factory-setup:begin/end -->` markers, so re-running
+   `agents-md` refreshes it in place (an older section without markers needs
+   `agents-md --migrate`). If the AGENTS.md / CLAUDE.md is new or lacks them, add: how to set up a fresh
    checkout (install dependencies, env files), how to start the dev server on a
    given port if there is one, and the validation commands matching `checks.sh`.
 4. **checks.sh.** Follow the *checks* procedure below.
@@ -67,11 +69,15 @@ not needed.
    - label one or two small issues `factory`, then run `/factory run`;
    - start with `concurrency: 1` and read every PR until trusted;
    - intake runs on Fable once per issue and, depending on plan, may bill to usage credits;
-   - the dashboard is served from the target project and reads its `factory/jobs/`. From the
-     repo root (do not `cd` into `factory/`: that moves your session's working directory), run it in
-     the background: `python3 -m http.server 8000 --bind 127.0.0.1 -d factory`, open
-     `http://localhost:8000/dashboard.html`, and stop it with `pkill -f "http.server 8000"`.
-     `--bind 127.0.0.1` keeps it off the LAN;
+   - the dashboard reads the project's `factory/jobs/`. From the repo root (never `cd` into
+     `factory/`: that moves your session's working directory) run `factory/bin/dashboard start`
+     (or `/factory dashboard`). It serves on 127.0.0.1 only, port `dashboard.port` in `config.json`
+     (default 8000), in the background, and prints the URL. It keeps running after the chat ends:
+     `factory/bin/dashboard status` checks it and `factory/bin/dashboard stop` stops it by its
+     recorded PID (never by process name). Nothing stops it automatically; a session-end hook in
+     the user's own settings is the user's choice, not something this skill installs;
+   - the gate does not accept skipped tests: a skipped, xfailed, deselected or not-run
+     test is a failure, never a pass;
    - `factory/checks.sh` and `factory/config.json` are protected, so the factory can
      never add a lint step itself, and the tailored approver escalates dependency
      changes. Tooling changes such as adding a linter are better done by a human
@@ -92,15 +98,44 @@ every job or lets bad code through, so be thorough.
    typecheck, tests and build, whichever exist. Non-interactive, no watch modes,
    nothing that rewrites files (no `--fix`, no `--update-snapshots`), exit non-zero
    on any failure, keep `set -euo pipefail`. Keep it fast.
-3. **Say what you left out.**
+3. **Never tolerate skips.** The owner's rule: **a test must never be skipped
+   because the system is misconfigured (that is a failure), and a test is never
+   reported as successful unless it ran and passed.** A skipped, xfailed,
+   deselected or not-run test is not a pass. Runners often exit 0 when tests only
+   skip ("1 passed, 1 skipped"), so an exit code alone isn't enough:
+   - **pytest:** run with `-rs`, tee the output, and fail the script if the summary
+     matches `[0-9]+ (skipped|xfailed|xpassed|deselected)`. The templates
+     (`python.sh`, `python-uv.sh`) do exactly this. Deselection counts: an
+     `addopts` of `-m "not expensive"` is a test that did not run, so the gate must
+     not allow it. Keep the guard in `checks.sh`, not in conftest: `checks.sh` is
+     protected, so a factory agent can't weaken it.
+   - **Other stacks:** jest/vitest `.skip`/`xit`/`todo`/`--testPathIgnorePatterns`,
+     Go `t.Skip` (`go test -v`, grep `--- SKIP`), Rust `#[ignore]`: the templates
+     show the grep for each. No `|| true` anywhere.
+   - `SCRIPT detect` greps for these (and for deselecting config) and lists them
+     under "TESTS THAT WOULD NOT RUN". Report them; fix them or ask the owner.
+     Never quietly exclude them.
+   - **Data-dependent tests.** A test that branches on what a real account or
+     dataset happens to contain ("skip if the account has no playlists") must be
+     restructured so every branch asserts something, preferably against stable
+     public reference data.
+   - **Costly tests** (live API calls that spend quota or money): do NOT quietly
+     exclude them. Ask the owner to decide, showing the trade-off: (a) run it on
+     every gate run (a job's gate runs about 4 or more times); (b) an offline
+     contract test every gate plus one live run at the merge gate; (c) an offline
+     contract test plus a live run on demand. Record the choice in a comment in
+     `checks.sh` and in AGENTS.md. Warn that if the quota runs out the gate fails
+     every job until it resets, which is correct, not a bug.
+4. **Say what you left out.**
    - Integration tests that need a database, Docker, network or secrets are the
-     usual casualties; list what you excluded (including excluded test markers)
-     and why, so the user decides. Never silently drop coverage.
+     usual casualties; list what you excluded and why, so the user decides. Never
+     silently drop coverage, and never exclude a test by skipping or deselecting it
+     (see step 3): an excluded test is a decision the owner makes.
    - If `detect` reported GAPS (no linter, no typechecker), tell the user plainly
      that the gate is only as strong as the tests and the build, and offer to add
      a linter as a separate, human-reviewed change. Not a factory issue:
      `checks.sh` is protected and dependency changes escalate.
-4. **Prove it can fail.** `verify-checks` tests the **committed** state (HEAD) in
+5. **Prove it can fail.** `verify-checks` tests the **committed** state (HEAD) in
    clean throwaway worktrees, like the gate. So commit `factory/checks.sh` first,
    and the project's own pending work too (lockfile, tests, pyproject changes);
    otherwise the clean runs fail for unrelated reasons and the result means
@@ -114,9 +149,13 @@ every job or lets bad code through, so be thorough.
    run failed fast without naming the file, so it may be an environment failure:
    read the full log before trusting it. A script that exits 0 on broken code is
    worse than none. If the repo has no tests or linter at all, say so plainly.
+   `verify-checks` also reads each clean run's output for skipped, xfailed,
+   xpassed, deselected, ignored or pending tests and FAILS if it finds any: a
+   test that did not run is not a pass. (If the output shows no counts at all,
+   the script isn't printing a summary: add `-rs`/`-v` so it does.)
    `verify-checks` refuses only for **tracked** changes (staged or modified);
    untracked files can't affect clean worktrees of HEAD, so it just notes them.
-5. **Show the user the final script** and the timings. It is protected, so this is
+6. **Show the user the final script** and the timings. It is protected, so this is
    the one deliberate review of what "passing" means here.
 
 ## upgrade
@@ -139,4 +178,9 @@ every job or lets bad code through, so be thorough.
    only when the payload changes. (An install from before 0.3.0 has no record of
    what was reviewed: run it once if the plan lists files whose payload you know
    is unchanged.)
-5. Run the init verify step, commit by explicit path, and ask before pushing.
+5. `upgrade-apply --yes` also makes sure `.gitignore` has the factory's lines (it
+   appends any that are missing, such as `/factory/.dashboard.pid`).
+   `upgrade-plan` flags a stale or unmarked factory section in AGENTS.md /
+   CLAUDE.md (for example one that still names the old dashboard command): run
+   `SCRIPT agents-md` (add `--migrate` for an old unmarked section) to refresh it.
+6. Run the init verify step, commit by explicit path, and ask before pushing.
