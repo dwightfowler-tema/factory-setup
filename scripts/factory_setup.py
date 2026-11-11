@@ -75,8 +75,22 @@ def repo_root():
 
 
 def dirty_paths(root):
+    """(tracked changes, untracked files). Only tracked changes make HEAD differ from what's on disk."""
     out = sh("git", "status", "--porcelain", "--untracked-files=all", cwd=root).stdout
-    return [line[3:] for line in out.splitlines()]
+    tracked = [line[3:] for line in out.splitlines() if not line.startswith("??")]
+    untracked = [line[3:] for line in out.splitlines() if line.startswith("??")]
+    return tracked, untracked
+
+
+def listing(paths, n=5):
+    return ", ".join(paths[:n]) + (f", and {len(paths) - n} more" if len(paths) > n else "")
+
+
+def code_sha(path):
+    """Hash of a script with comment and blank lines removed, to tell comment-only payload changes."""
+    lines = [l.rstrip() for l in Path(path).read_text().splitlines()]
+    keep = [l for l in lines if l.strip() and (not l.lstrip().startswith("#") or l.startswith("#!"))]
+    return hashlib.sha256("\n".join(keep).encode()).hexdigest()
 
 
 def load_manifest(root):
@@ -92,6 +106,10 @@ def write_manifest(root, files, installed_from=None):
         "skill_source": "dwightfowler-tema/factory-setup",
         # pristine = sha of the payload file as shipped; the target's own file may drift (adapted).
         "files": {f: sha(PAYLOAD / f) for f in files},
+        # comment-stripped hash of the shipped scripts: lets upgrade-plan call a change "comments only".
+        "code": {f: code_sha(PAYLOAD / f) for f in files if f in EXEC},
+        # payload hash a human last reviewed for held files (see upgrade-apply --mark-reviewed).
+        "reviewed": old.get("reviewed", {}),
     }
     (root / MANIFEST).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     (root / "factory" / "VERSION").write_text(VERSION + "\n")
@@ -142,11 +160,14 @@ def cmd_preflight(root, args):
         print(f"NOTE  factory already installed (v{manifest['version']}); use upgrade-plan, not copy")
     else:
         check("no existing files in the way", not clashes, ", ".join(clashes))
-    dirty = dirty_paths(root)
-    if dirty:
-        shown = ", ".join(dirty[:5]) + (f", and {len(dirty) - 5} more" if len(dirty) > 5 else "")
-        print(f"WARN  working tree has {len(dirty)} staged/uncommitted change(s): {shown}. Start the install from a "
-              "committed tree: verify-checks tests the committed state, so pending project work makes it meaningless.")
+    tracked, untracked = dirty_paths(root)
+    if tracked:
+        print(f"WARN  working tree has {len(tracked)} staged/modified tracked change(s): {listing(tracked)}. Start the "
+              "install from a committed tree: verify-checks tests the committed state, so pending project work "
+              "makes it meaningless.")
+    if untracked:
+        print(f"NOTE  {len(untracked)} untracked file(s): {listing(untracked)}. These can't affect clean worktrees "
+              "of HEAD; just don't commit them with the install.")
     if base:
         print(f"BASE_BRANCH={base}")
     sys.exit(0 if all(results) else 1)
@@ -347,21 +368,43 @@ def run_checks_in(worktree, checks):
     return res.returncode, int(time.monotonic() - start), (res.stdout + res.stderr)
 
 
-def tail(log, n=25):
-    return "\n".join(log.rstrip().splitlines()[-n:])
+NOISE = re.compile(
+    r"^\s*([+-]\s+\S+==\S+|(Resolved|Installed|Uninstalled|Prepared|Downloading|Downloaded|Audited|Built)\b"
+    r"|Collecting\b|Requirement already|Using cached|Successfully installed|Obtaining\b|Preparing metadata"
+    r"|Installing collected|npm (warn|notice)\b|added \d+ packages)")
+ERRLINE = re.compile(r"error|FAIL|Traceback", re.I)
+
+
+def summarize(log, n):
+    """Last n lines of the output with package-install chatter removed, and the first error-looking line."""
+    lines = [l for l in log.splitlines() if l.strip() and not NOISE.match(l)]
+    first = next((l for l in lines if ERRLINE.search(l)), None)
+    return lines[-n:], first
+
+
+def report(name, log, logdir, n, indent=""):
+    path = logdir / f"{name}.log"
+    path.write_text(log)
+    lines, first = summarize(log, n)
+    print(f"{indent}full log: {path}")
+    if first:
+        print(f"{indent}first error line: {first.strip()}")
+    print("\n".join(indent + l for l in lines))
 
 
 def cmd_verify_checks(root, args):
     checks = root / "factory" / "checks.sh"
     if not checks.exists():
         sys.exit("factory/checks.sh missing")
-    dirty = dirty_paths(root)
-    if dirty and not args.allow_dirty:
-        shown = ", ".join(dirty[:5]) + (f", and {len(dirty) - 5} more" if len(dirty) > 5 else "")
-        sys.exit(f"refusing: working tree has {len(dirty)} uncommitted change(s): {shown}.\n"
+    tracked, untracked = dirty_paths(root)
+    if tracked and not args.allow_dirty:
+        sys.exit(f"refusing: {len(tracked)} tracked file(s) are staged or modified: {listing(tracked)}.\n"
                  "verify-checks tests the COMMITTED state (HEAD) in clean worktrees, like the gate does. Commit the "
                  "project's pending work and factory/checks.sh first, or pass --allow-dirty to run anyway.")
+    if untracked:
+        print(f"NOTE  {len(untracked)} untracked file(s) ignored (they aren't in HEAD): {listing(untracked)}")
     tmp = Path(tempfile.mkdtemp(prefix="factory-verify-"))
+    logdir = Path(tempfile.mkdtemp(prefix="factory-verify-logs-"))  # kept so you can read full output
     wts = []
 
     def add(name):
@@ -376,8 +419,9 @@ def cmd_verify_checks(root, args):
         for i in (1, 2):
             code, secs, log = run_checks_in(clean, checks)
             print(f"{'PASS' if code == 0 else 'FAIL'}  clean run {i}: exit {code} in {secs}s")
+            (logdir / f"clean-{i}.log").write_text(log)
             if code:
-                print(tail(log))
+                report(f"clean-{i}", log, logdir, 25)
                 ok = False
         if args.break_file:
             if not ok:
@@ -394,9 +438,11 @@ def cmd_verify_checks(root, args):
                 fails = code != 0
                 print(f"{'PASS' if fails else 'FAIL'}  sabotaged {args.break_file}: checks.sh exit {code} in {secs}s"
                       + ("" if fails else "  <-- the gate would let broken code through"))
-                if fails:
-                    print("      sabotage output (read it: the failure should point at the broken file):")
-                    print("\n".join("      " + line for line in tail(log, 12).splitlines()))
+                print("      (the failure should point at the broken file, not at the environment)")
+                report("sabotage", log, logdir, 12, indent="      ")
+                if fails and secs < 2 and Path(args.break_file).name not in log:
+                    print(f"WARN  suspicious: fast failure ({secs}s) not mentioning {args.break_file}. It may be an "
+                          "environment failure rather than the sabotage; read the full log before trusting this.")
                 ok = ok and fails
         else:
             print("NOTE  no --break FILE given: the script was not shown to be able to fail")
@@ -408,10 +454,33 @@ def cmd_verify_checks(root, args):
 
 
 # ------------------------------------------------------------------ upgrade
+def diff_stat(target, new):
+    import difflib
+    a = (Path(target)).read_text().splitlines()
+    b = (Path(new)).read_text().splitlines()
+    return sum(1 for l in difflib.unified_diff(a, b, lineterm="", n=0) if l[:1] in "+-" and l[:3] not in ("+++", "---"))
+
+
 def classify(root, manifest):
     """Compare each payload file against the target and the install-time manifest."""
     rows = []
     files = payload_files()
+    reviewed = manifest.get("reviewed", {})
+    code = manifest.get("code", {})
+
+    def held_row(f, kind, target, new, pristine):
+        base = reviewed.get(f) or pristine
+        if base == new:
+            since = "last review" if f in reviewed else "install"
+            return (f, "kept", f"{'project-owned' if f in PROJECT_OWNED else 'adapted'}; "
+                               f"payload unchanged since {since}, nothing to merge")
+        note = "payload changed"
+        if f in EXEC and code.get(f) == code_sha(PAYLOAD / f):
+            note += " (comments only; safe to ignore)"
+        note += f"; {diff_stat(target, PAYLOAD / f)} line(s) differ from your copy"
+        note += ". Never overwritten; merge by hand" if f in PROJECT_OWNED else ". Merge by hand"
+        return (f, kind, note)
+
     for f in files:
         new = sha(PAYLOAD / f)
         target = root / f
@@ -419,8 +488,8 @@ def classify(root, manifest):
         if not target.exists():
             rows.append((f, "missing" if pristine else "new", ""))
         elif f in PROJECT_OWNED:
-            rows.append((f, "current" if sha(target) == new else "project-owned",
-                         "never overwritten by an upgrade; merge new keys/comments by hand if wanted"))
+            rows.append((f, "current", "") if sha(target) == new
+                        else held_row(f, "project-owned", target, new, pristine))
         elif pristine is None:
             rows.append((f, "clash", "new in payload but a file already exists"))
         elif sha(target) == new:
@@ -428,8 +497,7 @@ def classify(root, manifest):
         elif sha(target) == pristine:
             rows.append((f, "safe", "untouched since install; payload changed"))
         else:
-            kind = "adapted" if f in ADAPTED else "modified"
-            rows.append((f, kind, "locally changed; merge by hand"))
+            rows.append(held_row(f, "adapted" if f in ADAPTED else "modified", target, new, pristine))
     for f in manifest["files"]:
         if f not in set(files):
             rows.append((f, "removed-upstream", "no longer in payload"))
@@ -445,12 +513,23 @@ def cmd_upgrade_plan(root, args):
     if not manifest:
         sys.exit("no manifest: this repo wasn't installed by factory-setup (or was before v0.1.0)")
     print(f"installed {manifest['version']} -> available {VERSION}")
-    for f, kind, note in classify(root, manifest):
-        if kind != "current":
-            print(f"{kind:17} {f}  {note}")
-    print(f"\n`{'`, `'.join(APPLY_KINDS)}` are applied by `upgrade-apply --yes`. "
-          f"`{'`/`'.join(HELD_KINDS)}` are held: diff and merge by hand:")
-    print(f"  diff -u <target> {PAYLOAD}/<file>")
+    rows = classify(root, manifest)
+    kept = [f for f, kind, _ in rows if kind == "kept"]
+    todo = [r for r in rows if r[1] in APPLY_KINDS]
+    held = [r for r in rows if r[1] in HELD_KINDS]
+    other = [r for r in rows if r[1] == "removed-upstream"]
+    for f, kind, note in todo + held + other:
+        print(f"{kind:17} {f}  {note}")
+    if kept:
+        print(f"kept              {len(kept)} tailored file(s) with nothing to merge (payload unchanged): "
+              + ", ".join(kept))
+    if not (todo or held or other):
+        print("Nothing to do: only the version stamp and manifest will be refreshed.")
+    if todo:
+        print(f"\n`{'`, `'.join(APPLY_KINDS)}` are applied by `upgrade-apply --yes`.")
+    if held:
+        print("Held files are never overwritten: `diff -u <target> " + f"{PAYLOAD}/<file>`, merge by hand, then "
+              "`upgrade-apply --yes --mark-reviewed` so they aren't flagged again until the payload changes.")
 
 
 def cmd_upgrade_apply(root, args):
@@ -460,9 +539,12 @@ def cmd_upgrade_apply(root, args):
     rows = classify(root, manifest)
     todo = [f for f, kind, _ in rows if kind in APPLY_KINDS]
     held = {f for f, kind, _ in rows if kind in HELD_KINDS}
+    keep = held | {f for f, kind, _ in rows if kind == "kept"}
+    old_version = manifest["version"]
     if not args.yes:
-        print("DRY RUN: nothing changed. Would overwrite: " + (", ".join(todo) or "nothing"))
+        print("DRY RUN: nothing changed. Would overwrite: " + (", ".join(todo) or "no payload files"))
         print("Would hold for a manual merge: " + (", ".join(sorted(held)) or "nothing"))
+        print(f"Would update factory/VERSION {old_version} -> {VERSION} and the manifest.")
         print("Review upgrade-plan with the user, then re-run with --yes.")
         return
     for f in todo:
@@ -471,18 +553,29 @@ def cmd_upgrade_apply(root, args):
         shutil.copy2(PAYLOAD / f, dest)
         if f in EXEC:
             dest.chmod(0o755)
-    old_files = manifest["files"]
-    write_manifest(root, [f for f in payload_files() if f not in held],
+    write_manifest(root, [f for f in payload_files() if f not in keep],
                    installed_from=manifest.get("installed_from"))
     new = load_manifest(root)
-    for f in held:
-        if f in old_files:  # keep the old pristine hash so later upgrades still see the drift
-            new["files"][f] = old_files[f]
+    for f in keep:  # keep the old pristine/code hashes so a later upgrade still sees real payload changes
+        if f in manifest["files"]:
+            new["files"][f] = manifest["files"][f]
+        if f in manifest.get("code", {}):
+            new.setdefault("code", {})[f] = manifest["code"][f]
+    reviewed = dict(manifest.get("reviewed", {}))
+    if args.mark_reviewed:
+        for f in held:
+            reviewed[f] = sha(PAYLOAD / f)
+    new["reviewed"] = reviewed
     (root / MANIFEST).write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
-    print("applied: " + (", ".join(todo) or "nothing"))
-    if held:
+    stamp = (f"Updated factory/VERSION {old_version} -> {VERSION}" if old_version != VERSION
+             else f"factory/VERSION already {VERSION}")
+    print(f"{stamp} and the manifest; "
+          + (f"overwrote {len(todo)} untouched file(s): {', '.join(todo)}." if todo else "no payload files overwritten."))
+    if held and not args.mark_reviewed:
         print("still to merge by hand: " + ", ".join(sorted(held)))
-    print("factory/VERSION now says " + VERSION)
+        print("when merged or declined, run `upgrade-apply --yes --mark-reviewed`.")
+    elif held:
+        print("marked as reviewed (not flagged again until the payload changes): " + ", ".join(sorted(held)))
 
 
 # --------------------------------------------------------------------- main
@@ -512,10 +605,13 @@ def build_parser():
     ver = add("verify-checks", "run factory/checks.sh in clean worktrees of HEAD (twice); optionally sabotage")
     ver.add_argument("--break", dest="break_file", metavar="FILE",
                      help="also append garbage to FILE in a throwaway worktree and require checks.sh to FAIL")
-    ver.add_argument("--allow-dirty", action="store_true", help="run even though the working tree is dirty")
+    ver.add_argument("--allow-dirty", action="store_true", help="run even though tracked files are staged or modified")
     add("upgrade-plan", "compare the repo with this skill's payload (read-only)")
     up = add("upgrade-apply", "overwrite only files untouched since install (dry run unless --yes)")
     up.add_argument("--yes", action="store_true", help="actually overwrite the safe files")
+    up.add_argument("--mark-reviewed", action="store_true",
+                    help="record that held files' current payload was reviewed (merged or declined), so "
+                         "later upgrades flag them only if the payload changes again")
     return p
 
 
