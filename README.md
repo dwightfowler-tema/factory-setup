@@ -24,7 +24,7 @@ Update with `git pull`, then run `/reload-skills` in any running Claude Code ses
 
 - `SKILL.md`: mode selection and rules; it makes the session read `INSTALL.md` first.
 - `INSTALL.md`: the detailed procedure for `init`, `checks` and `upgrade` (judgment: which checks, tailoring, what to tell you).
-- `scripts/factory_setup.py`: the deterministic parts (preflight, copy, manifest, gitignore, labels, `config get|set`, check detection, sabotage verification, upgrade classification; `labels` and `upgrade-apply` are dry runs until `--yes`). Stdlib only.
+- `scripts/factory_setup.py`: the deterministic parts (preflight, copy, manifest, gitignore, AGENTS.md section, labels, `config get|set`, check detection, sabotage verification, upgrade classification; `labels` and `upgrade-apply` are dry runs until `--yes`). Stdlib only.
 - `payload/`: the generic factory files, copied verbatim into a target repo.
 - `templates/`: `checks.sh` starting points per stack (incl. `python-uv`) and the AGENTS.md section.
 - `VERSION`: stamped into each target as `factory/VERSION`, with a manifest of file hashes so `upgrade` can tell untouched files from tailored ones.
