@@ -9,6 +9,8 @@
 - The AGENTS.md section is now wrapped in `<!-- factory-setup:begin/end -->` markers and uses `factory/bin/dashboard`.
   `agents-md` refreshes a marked section in place; `agents-md --migrate` replaces an old unmarked one.
   `upgrade-plan` flags a stale or unmarked section.
+- `config set` now edits only the characters of the value (or inserts the new key next to its siblings in the
+  same style) instead of re-indenting the whole file; the shipped compact formatting survives.
 - `gitignore` also adds `/factory/.dashboard.pid` and `/factory/.dashboard.log`; `upgrade-apply --yes` adds any missing lines.
 
 **Testing rule: never skip, never report a skip as a pass**

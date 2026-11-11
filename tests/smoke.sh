@@ -94,6 +94,13 @@ $S config set routing.medium.code opus >/dev/null || fail "nested key"
 $S config set nope.key 1 2>/dev/null && fail "unknown key should be rejected"
 $S config set typo 1 2>/dev/null && fail "unknown top-level key should be rejected"
 $S config set typo 1 --add >/dev/null || fail "--add should create"
+# config set edits only the touched characters: the shipped compact formatting survives
+grep -q '"low":    { "code": "haiku" }' factory/config.json || fail "config set must not reformat untouched lines"
+grep -q '"ports": { "base": 5200, "step": 10 }' factory/config.json || fail "config set should keep compact objects compact"
+$S config set --add brand.new.key 1 >/dev/null || fail "--add of a nested key under a missing parent"
+[ "$($S config get brand.new.key)" = 1 ] || fail "nested --add value"
+cp factory/config.json "$T/c1.json"; $S config set merge_method rebase >/dev/null
+[ "$(diff "$T/c1.json" factory/config.json | grep -c '^>')" = 1 ] || fail "config set should change exactly one line"
 cp factory/config.json "$T/before.json"
 echo '{bad' > factory/config.json; $S config get ports.base 2>/dev/null && fail "invalid JSON should error"
 [ "$(cat factory/config.json)" = '{bad' ] || fail "invalid config must be left untouched"

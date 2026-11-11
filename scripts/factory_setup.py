@@ -315,6 +315,94 @@ def _walk(data, dotted, create=False):
     return node, keys[-1]
 
 
+# --- minimal JSON scanner: find a value's span in the raw text so `config set` edits only those characters
+def _ws(t, i):
+    while i < len(t) and t[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _value_end(t, i):
+    """Index just past the JSON value that starts at t[i]."""
+    c = t[i]
+    if c == '"':
+        i += 1
+        while t[i] != '"':
+            i += 2 if t[i] == "\\" else 1
+        return i + 1
+    if c in "{[":
+        close = "}" if c == "{" else "]"
+        i = _ws(t, i + 1)
+        while t[i] != close:
+            if c == "{":
+                i = _ws(t, _value_end(t, i))  # key
+                i = _ws(t, i + 1)             # colon
+            i = _ws(t, _value_end(t, i))
+            if t[i] == ",":
+                i = _ws(t, i + 1)
+        return i + 1
+    while i < len(t) and t[i] not in ",}] \t\r\n":
+        i += 1
+    return i
+
+
+def _members(t, i):
+    """Members of the object starting at t[i]: [(key, key_start, value_start, value_end)]."""
+    out = []
+    i = _ws(t, i + 1)
+    while t[i] != "}":
+        ks = i
+        ke = _value_end(t, i)
+        i = _ws(t, _ws(t, ke) + 1)
+        ve = _value_end(t, i)
+        out.append((json.loads(t[ks:ke]), ks, i, ve))
+        i = _ws(t, ve)
+        if t[i] == ",":
+            i = _ws(t, i + 1)
+    return out
+
+
+def _inline(value):
+    return json.dumps(value, separators=(", ", ": "))
+
+
+def _edit_text(text, dotted, new, add):
+    """Return text with only the target value replaced or added, or None to fall back to a rewrite."""
+    keys = dotted.split(".")
+    obj = _ws(text, 0)
+    if text[obj] != "{":
+        return None
+    for n, k in enumerate(keys):
+        members = _members(text, obj)
+        hit = [m for m in members if m[0] == k]
+        last = n == len(keys) - 1
+        if hit and last:
+            _, _, vs, ve = hit[0]
+            return text[:vs] + _inline(new) + text[ve:]
+        if hit:
+            obj = hit[0][2]
+            if text[obj] != "{":
+                return None
+            continue
+        if not add:
+            return None
+        # k is missing here: add it (wrapping the value in the remaining nested keys) to this object
+        value = new
+        for rest in reversed(keys[n + 1:]):
+            value = {rest: value}
+        end = _value_end(text, obj)  # just past the closing brace
+        entry = f"{json.dumps(k)}: {_inline(value)}"
+        if not members:
+            return text[:obj + 1] + " " + entry + " " + text[end - 1:]
+        last_end = members[-1][3]
+        if "\n" in text[obj:end]:
+            line_start = text.rfind("\n", 0, members[-1][1]) + 1
+            indent = text[line_start:members[-1][1]]
+            return text[:last_end] + ",\n" + indent + entry + text[last_end:]
+        return text[:last_end] + ", " + entry + text[last_end:]
+    return None
+
+
 def cmd_config(root, args):
     path = _config_path(root)
     data, trailing_nl = _config_load(path)
@@ -328,17 +416,39 @@ def cmd_config(root, args):
         new = json.loads(args.value)
     except json.JSONDecodeError:
         new = args.value
-    node, key = _walk(data, args.key, create=args.add)
-    if key not in node and not args.add:
+    node, key = _walk(data, args.key, create=False) if not args.add else _walk_or_none(data, args.key)
+    if (node is None or key not in node) and not args.add:
         sys.exit(f"no such key: {args.key} (pass --add to create it)")
-    old = node.get(key, "<unset>")
-    node[key] = new
-    out = json.dumps(data, indent=2) + ("\n" if trailing_nl else "")
-    json.loads(out)  # re-validate before touching the real file
+    old = node.get(key, "<unset>") if node is not None else "<unset>"
+    text = path.read_text()
+    out = _edit_text(text, args.key, new, args.add)
+    note = ""
+    if out is None:  # unusual shapes (e.g. a parent that isn't an object): rebuild, which re-indents the file
+        node, key = _walk(data, args.key, create=True)
+        node[key] = new
+        out = json.dumps(data, indent=2) + ("\n" if trailing_nl else "")
+        note = "  (NOTE: unusual structure, so the file was re-indented)"
+    check = json.loads(out)  # re-validate before touching the real file, and verify the value landed
+    probe = check
+    for k in args.key.split("."):
+        probe = probe[k]
+    if probe != new:
+        sys.exit("internal error: edited value did not parse back to the requested value; file left untouched")
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(out)
     os.replace(tmp, path)
-    print(f"{args.key}: {json.dumps(old) if old != '<unset>' else old} -> {json.dumps(new)}")
+    print(f"{args.key}: {json.dumps(old) if old != '<unset>' else old} -> {json.dumps(new)}{note}")
+
+
+def _walk_or_none(data, dotted):
+    """Like _walk, but returns (None, key) when a parent is missing (so --add can create it)."""
+    keys = dotted.split(".")
+    node = data
+    for k in keys[:-1]:
+        if not isinstance(node, dict) or k not in node:
+            return None, keys[-1]
+        node = node[k]
+    return (node if isinstance(node, dict) else None), keys[-1]
 
 
 # ------------------------------------------------------------------- detect
