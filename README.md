@@ -18,7 +18,7 @@ git clone https://github.com/dwightfowler-tema/factory-setup ~/prj/factory-setup
 ln -s ~/prj/factory-setup ~/.claude/skills/factory-setup
 ```
 
-Update with `git pull`. Or clone straight to `~/.claude/skills/factory-setup`.
+Update with `git pull`, then run `/reload-skills` in any running Claude Code session (no restart needed). Or clone straight to `~/.claude/skills/factory-setup`.
 
 ## How it's split
 
