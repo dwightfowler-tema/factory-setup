@@ -9,6 +9,9 @@ directory shown when the skill loaded), run from the **target repo's root**:
 `python3 <skill-dir>/scripts/factory_setup.py <command>`. Learn the commands
 from `SCRIPT --help`.
 
+After editing this skill, run `/reload-skills` in any running session; a restart is
+not needed.
+
 ## init
 
 1. **Preflight.** `SCRIPT preflight`. On any FAIL stop and tell the user what to
@@ -64,8 +67,11 @@ from `SCRIPT --help`.
    - label one or two small issues `factory`, then run `/factory run`;
    - start with `concurrency: 1` and read every PR until trusted;
    - intake runs on Fable once per issue and, depending on plan, may bill to usage credits;
-   - the dashboard is served from the target project: `cd factory && python3 -m http.server`,
-     then `http://localhost:8000/dashboard.html`. It reads that project's `factory/jobs/`;
+   - the dashboard is served from the target project and reads its `factory/jobs/`. From the
+     repo root (do not `cd` into `factory/`: that moves your session's working directory), run it in
+     the background: `python3 -m http.server 8000 --bind 127.0.0.1 -d factory`, open
+     `http://localhost:8000/dashboard.html`, and stop it with `pkill -f "http.server 8000"`.
+     `--bind 127.0.0.1` keeps it off the LAN;
    - `factory/checks.sh` and `factory/config.json` are protected, so the factory can
      never add a lint step itself, and the tailored approver escalates dependency
      changes. Tooling changes such as adding a linter are better done by a human
@@ -101,10 +107,15 @@ every job or lets bad code through, so be thorough.
    nothing. `verify-checks` refuses on a dirty tree. Then
    `SCRIPT verify-checks --break <a real source file>`. It runs the script twice
    cleanly (catches flakiness and missing install steps) and once with the file
-   sabotaged (must fail), printing the sabotage output so a vacuous pass is
-   visible: read it, the failure should point at the broken file. A script that
-   exits 0 on broken code is worse than none. If the repo has no tests or linter
-   at all, say so plainly.
+   sabotaged (must fail). Each run's full output is saved and its log path printed;
+   the summary drops install chatter (`+ pkg==x`, `Resolved`, `Downloading`, ...),
+   shows the first error-looking line, and the last lines that remain. Read it: the
+   failure should point at the broken file. A `WARN suspicious` means the sabotaged
+   run failed fast without naming the file, so it may be an environment failure:
+   read the full log before trusting it. A script that exits 0 on broken code is
+   worse than none. If the repo has no tests or linter at all, say so plainly.
+   `verify-checks` refuses only for **tracked** changes (staged or modified);
+   untracked files can't affect clean worktrees of HEAD, so it just notes them.
 5. **Show the user the final script** and the timings. It is protected, so this is
    the one deliberate review of what "passing" means here.
 
@@ -113,12 +124,19 @@ every job or lets bad code through, so be thorough.
 1. `SCRIPT upgrade-plan` (read-only). It compares the repo with this skill's
    payload using the install-time manifest.
 2. Explain the buckets: `safe`/`new`/`missing` are untouched-since-install or
-   absent. `adapted`/`modified`/`clash` have local changes. `project-owned`
-   (`factory/checks.sh`, `factory/config.json`) are never overwritten.
+   absent. `kept` are tailored files whose payload hasn't changed, so there is
+   nothing to merge. `adapted`/`modified`/`clash` are tailored files whose payload
+   changed, and `project-owned` (`factory/checks.sh`, `factory/config.json`) are
+   never overwritten; the note says how many lines differ and whether the payload
+   change is comments only.
 3. `SCRIPT upgrade-apply` is a dry run. With the user's go-ahead, run
    `SCRIPT upgrade-apply --yes`: it overwrites only `safe`, `new` and `missing`
-   files and refreshes the manifest.
+   files, refreshes the manifest and says exactly what it did.
 4. For each held file, `diff -u` the repo's copy against `payload/<file>` and merge
    by hand, preserving the project's tailoring. For `config.json` merge new keys
-   with `config set --add`.
+   with `config set --add`. When the user has merged or declined, run
+   `SCRIPT upgrade-apply --yes --mark-reviewed` so those files are flagged again
+   only when the payload changes. (An install from before 0.3.0 has no record of
+   what was reviewed: run it once if the plan lists files whose payload you know
+   is unchanged.)
 5. Run the init verify step, commit by explicit path, and ask before pushing.
